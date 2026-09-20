@@ -41,9 +41,28 @@ aeterna-runtime = { workspace = true }
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]
+norecursedirs = [
+  ".*",
+  "__pycache__",
+  "*.egg-info",
+  "dist",
+  "build",
+  ".tox",
+  ".nox",
+  ".git",
+  ".hg",
+  ".mypy_cache",
+  ".pytest_cache",
+  ".hypothesis",
+  ".venv",
+  "venv",
+  "tools",
+]
 
 [tool.coverage.run]
 branch = true
+relative_files = true
+omit = ["tools/**"]
 
 [tool.coverage.report]
 fail_under = 95

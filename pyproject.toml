@@ -61,6 +61,7 @@ norecursedirs = [
 
 [tool.coverage.run]
 branch = true
+relative_files = true
 omit = ["tools/**"]
 
 [tool.coverage.report]

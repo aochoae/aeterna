@@ -1,0 +1,71 @@
+[project]
+name = "aeterna"
+version = "1.0.0.dev1"
+requires-python = ">=3.12"
+dependencies = [
+  "aeterna-di",
+  "aeterna-config",
+  "aeterna-config-yaml",
+  "aeterna-runtime",
+]
+
+[dependency-groups]
+dev = [
+  "build>=1.2",
+  "hypothesis>=6.100",
+  "mypy>=1.11",
+  "pyperf>=2.6",
+  "pytest>=8.3",
+  "pytest-asyncio>=0.24",
+  "pytest-cov>=7.1.0",
+  "ruff>=0.8",
+  "types-PyYAML>=6.0",
+]
+docs = [
+  "Sphinx>=7.4,<9",
+  "sphinxcontrib-mermaid==2.1.1",
+]
+
+[tool.uv.workspace]
+members = ["packages/*"]
+
+[tool.uv]
+package = false
+
+[tool.uv.sources]
+aeterna-di = { workspace = true }
+aeterna-config = { workspace = true }
+aeterna-config-yaml = { workspace = true }
+aeterna-runtime = { workspace = true }
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+
+[tool.coverage.run]
+branch = true
+
+[tool.coverage.report]
+fail_under = 95
+show_missing = true
+
+[tool.ruff]
+target-version = "py312"
+line-length = 100
+extend-exclude = [".uv-cache"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "ASYNC"]
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
+files = ["packages"]
+namespace_packages = true
+explicit_package_bases = true
+mypy_path = [
+  "packages/aeterna-di/src",
+  "packages/aeterna-config/src",
+  "packages/aeterna-config-yaml/src",
+  "packages/aeterna-runtime/src",
+]

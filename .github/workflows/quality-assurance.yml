@@ -106,6 +106,12 @@ jobs:
         run: test -s coverage.xml
       - name: SonarQube Scan
         uses: SonarSource/sonarqube-scan-action@7006c4492b2e0ee0f816d36501671557c97f5995 # v8.1.0
+        with:
+          args: >-
+            -Dsonar.python.version=3.12
+            -Dsonar.sources=packages
+            -Dsonar.tests=tests
+            -Dsonar.python.coverage.reportPaths=coverage.xml
         env:
           SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
 

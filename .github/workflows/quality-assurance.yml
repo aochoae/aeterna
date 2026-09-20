@@ -3,6 +3,8 @@ name: Quality Assurance
 on:
   push:
     branches:
+      - main
+      - release/*
       - develop
       - feature/*
       - bugfix/*

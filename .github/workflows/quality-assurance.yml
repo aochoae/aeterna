@@ -128,6 +128,7 @@ jobs:
       fail-fast: false
       matrix:
         include:
+          - package: aeterna
           - package: aeterna-di
           - package: aeterna-config
           - package: aeterna-config-yaml
@@ -169,6 +170,7 @@ jobs:
       fail-fast: false
       matrix:
         include:
+          - package: aeterna
           - package: aeterna-di
           - package: aeterna-config
           - package: aeterna-config-yaml
@@ -213,6 +215,17 @@ jobs:
               "--find-links", str(artifacts), str(wheels[0]),
           ])
           print(version(package))
+
+          if package == "aeterna":
+              for module in (
+                  "aeterna.config",
+                  "aeterna.config_yaml",
+                  "aeterna.di",
+                  "aeterna.runtime",
+              ):
+                  importlib.import_module(module)
+              print("aeterna meta-package dependencies import cleanly")
+              raise SystemExit(0)
 
           # PEP 561: the installed package must carry a py.typed marker, otherwise
           # downstream type checkers silently treat every aeterna import as Any.

@@ -5,9 +5,11 @@ Requirements
 ------------
 
 Aeterna supports Python 3.12 and later. The repository is a ``uv`` workspace
-with four installable packages designed for modular, lifecycle-aware
-application composition:
+with four component packages and one convenience distribution designed for
+modular, lifecycle-aware application composition:
 
+* ``aeterna`` — metadata-only convenience distribution that installs all four
+  component packages.
 * ``aeterna-di`` — explicit asynchronous dependency injection with singleton,
   scoped, and transient lifetimes.
 * ``aeterna-config`` — immutable layered configuration with recursive merging
@@ -42,6 +44,19 @@ Install packages individually
 Install only the packages an application needs. A hosted application normally
 uses ``aeterna-runtime``; add ``aeterna-config-yaml`` only when it reads YAML.
 YAML is an adapter, not a dependency of ``aeterna-config``.
+
+Install the complete framework distribution
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+The ``aeterna`` distribution installs ``aeterna-config``,
+``aeterna-config-yaml``, ``aeterna-di``, and ``aeterna-runtime``:
+
+.. code-block:: console
+
+   $ python -m pip install aeterna
+
+The distribution contains no additional runtime module. Applications continue
+to import from the public modules provided by the component packages.
 
 Install with pip
 ~~~~~~~~~~~~~~~~

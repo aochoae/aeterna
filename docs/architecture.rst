@@ -30,7 +30,9 @@ package. The YAML adapter depends on configuration; the runtime depends on
 both core packages. Each distribution contributes a focused subpackage to the
 shared ``aeterna`` namespace: ``aeterna.config``, ``aeterna.di``,
 ``aeterna.config_yaml``, or ``aeterna.runtime``. Keep adapters and
-application-specific integrations out of the core packages.
+application-specific integrations out of the core packages. The top-level
+``aeterna`` distribution is metadata-only: it installs these component
+distributions and contributes no additional Python implementation.
 
 Composition flow
 ----------------

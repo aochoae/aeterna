@@ -13,7 +13,8 @@ shutdown semantics.
 Use only the layers your application needs. ``aeterna-config`` and
 ``aeterna-di`` are independent core packages. ``aeterna-config-yaml`` adds the
 optional YAML provider, and ``aeterna-runtime`` composes configuration and DI
-into an application host.
+into an application host. The ``aeterna`` distribution is a metadata-only
+convenience package that installs all four components together.
 
 Why Aeterna
 -----------

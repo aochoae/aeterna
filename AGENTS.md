@@ -8,10 +8,11 @@ It is intentionally modular: applications can use the configuration and DI
 cores without adopting the runtime host, and integrations remain outside the
 core packages.
 
-The repository is a `uv` workspace. The root project is an aggregate
-development project (`tool.uv.package = false`); the four installable workspace
-members are all version `1.0.0.dev1` and contribute typed subpackages to the
-shared `aeterna` namespace:
+The repository is a `uv` workspace. The root project is an aggregate development
+project (`tool.uv.package = false`); the five installable workspace members are
+all version `1.0.0.dev1`. The `aeterna` member is a metadata-only convenience
+distribution, while the four component members contribute typed subpackages to
+the shared `aeterna` namespace:
 
 - `aeterna-config` — standard-library configuration providers, merging,
   immutable snapshots, provenance, and typed binding.
@@ -27,8 +28,8 @@ shared `aeterna` namespace:
 - `packages/*/src/aeterna/` contains package implementation. Public symbols
   are exported from each package’s `__init__.py`; keep implementation details
   in focused modules.
-- `packages/*/README.md` and each package `pyproject.toml` describe the
-  individual distribution and its runtime dependencies.
+- `README.md`, `packages/*/README.md`, and each package `pyproject.toml`
+  describe the distributions and their runtime dependencies.
 - `tests/` contains pytest coverage for configuration, DI, YAML, runtime
   lifecycle/hosting, package boundaries, and synchronized package versions.
 - `docs/` contains Sphinx guides and API reference sources. The guides are the
@@ -167,12 +168,14 @@ uv run python -m sphinx -W --keep-going -b html docs docs/_build/html
 
 Apply formatting with `uv run ruff format .`. Run the informational benchmark
 with `uv run python tools/benchmark.py`. Build one distribution with
-`uv run python -m build --sdist --wheel packages/<package>`. CI builds all four
-packages and smoke-tests each wheel, including importability and the `py.typed`
-marker; it builds sdists but does not install them in the smoke-test job. For
-release validation, install each wheel and sdist separately in a fresh virtual
+`uv run python -m build --sdist --wheel packages/aeterna` builds the metadata-only
+meta-package; the `packages/<package>` form builds a component package. CI builds
+all five distributions, smoke-tests component wheels for importability and
+`py.typed`, and verifies that the meta-package installs its component
+dependencies. It builds sdists but does not install them in the smoke-test job. For release
+validation, install each wheel and sdist separately in a fresh virtual
 environment, then verify the package version, public imports, and `py.typed`
-marker. Keep all built artifacts in `packages/*/dist/` and do not commit them.
+marker. Keep built artifacts out of version control.
 
 CI runs pytest, Ruff, format checks, and mypy on Ubuntu, macOS, and Windows
 with Python 3.12, 3.13, and 3.14. A separate Ubuntu job enforces 95% branch

@@ -38,3 +38,26 @@ def test_package_versions_are_synchronized() -> None:
         tomllib.loads(path.read_text(encoding="utf-8"))["project"]["version"] for path in manifests
     }
     assert len(versions) == 1
+
+
+def test_meta_package_declares_all_core_packages() -> None:
+    root = Path(__file__).parents[1]
+    manifest = tomllib.loads(
+        (root / "packages" / "aeterna" / "pyproject.toml").read_text(encoding="utf-8")
+    )
+    dependencies = set(manifest["project"]["dependencies"])
+
+    assert dependencies == {
+        "aeterna-config>=1.0.0.dev1,<2",
+        "aeterna-config-yaml>=1.0.0.dev1,<2",
+        "aeterna-di>=1.0.0.dev1,<2",
+        "aeterna-runtime>=1.0.0.dev1,<2",
+    }
+
+
+def test_meta_package_is_metadata_only() -> None:
+    root = Path(__file__).parents[1]
+    source = root / "packages" / "aeterna" / "src" / "aeterna"
+
+    assert (source / "py.typed").is_file()
+    assert not any(source.rglob("*.py"))

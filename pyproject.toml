@@ -1,5 +1,5 @@
 [project]
-name = "aeterna"
+name = "aeterna-workspace"
 version = "1.0.0.dev1"
 requires-python = ">=3.12"
 dependencies = [

@@ -30,6 +30,7 @@ single monolithic application shell with hidden composition rules.
 
 | Package               | Purpose                                                                                                      |
 |-----------------------|--------------------------------------------------------------------------------------------------------------|
+| `aeterna`             | Convenience distribution that installs the complete Aeterna package set                                    |
 | `aeterna-config`      | Async configuration providers, recursive overlays, immutable snapshots, provenance, and strict typed binding |
 | `aeterna-di`          | Type-keyed service registration and async resolution with singleton, scoped, and transient lifetimes         |
 | `aeterna-config-yaml` | Optional YAML configuration provider using PyYAML                                                            |
@@ -37,6 +38,20 @@ single monolithic application shell with hidden composition rules.
 
 `aeterna-config` and `aeterna-di` have no dependencies on another aeterna package. The YAML
 adapter depends on configuration; the runtime depends on configuration and DI.
+
+The `aeterna` distribution is a metadata-only convenience package. It installs all four
+component packages but does not add another runtime module or change the shared namespace.
+
+## Installation
+
+Install the complete framework distribution with:
+
+```bash
+python -m pip install aeterna
+```
+
+Applications that need only part of the framework can continue to install the component
+packages individually, such as `aeterna-config`, `aeterna-di`, or `aeterna-runtime`.
 
 ## Quick example
 
@@ -116,10 +131,12 @@ uv run python -m sphinx -W --keep-going -b html docs docs/_build/html
 Build distributions with:
 
 ```bash
+uv run python -m build --sdist --wheel packages/aeterna
 uv run python -m build --sdist --wheel packages/<package>
 ```
 
-CI smoke-tests the built wheels for importability and the `py.typed` marker. For release validation,
+CI smoke-tests the component wheels for importability and the `py.typed` marker, and verifies that
+the metadata-only `aeterna` wheel installs its component dependencies. For release validation,
 install each wheel and sdist separately in a fresh virtual environment and verify the package
 version, public imports, and `py.typed` marker. Built artifacts are written to `packages/*/dist/`
 and should not be committed.

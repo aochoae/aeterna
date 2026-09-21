@@ -13,10 +13,70 @@ members = [
     "aeterna-config-yaml",
     "aeterna-di",
     "aeterna-runtime",
+    "aeterna-workspace",
 ]
 
 [[package]]
 name = "aeterna"
+version = "1.0.0.dev1"
+source = { editable = "packages/aeterna" }
+dependencies = [
+    { name = "aeterna-config" },
+    { name = "aeterna-config-yaml" },
+    { name = "aeterna-di" },
+    { name = "aeterna-runtime" },
+]
+
+[package.metadata]
+requires-dist = [
+    { name = "aeterna-config", editable = "packages/aeterna-config" },
+    { name = "aeterna-config-yaml", editable = "packages/aeterna-config-yaml" },
+    { name = "aeterna-di", editable = "packages/aeterna-di" },
+    { name = "aeterna-runtime", editable = "packages/aeterna-runtime" },
+]
+
+[[package]]
+name = "aeterna-config"
+version = "1.0.0.dev1"
+source = { editable = "packages/aeterna-config" }
+
+[[package]]
+name = "aeterna-config-yaml"
+version = "1.0.0.dev1"
+source = { editable = "packages/aeterna-config-yaml" }
+dependencies = [
+    { name = "aeterna-config" },
+    { name = "pyyaml" },
+]
+
+[package.metadata]
+requires-dist = [
+    { name = "aeterna-config", editable = "packages/aeterna-config" },
+    { name = "pyyaml", specifier = ">=6.0" },
+]
+
+[[package]]
+name = "aeterna-di"
+version = "1.0.0.dev1"
+source = { editable = "packages/aeterna-di" }
+
+[[package]]
+name = "aeterna-runtime"
+version = "1.0.0.dev1"
+source = { editable = "packages/aeterna-runtime" }
+dependencies = [
+    { name = "aeterna-config" },
+    { name = "aeterna-di" },
+]
+
+[package.metadata]
+requires-dist = [
+    { name = "aeterna-config", editable = "packages/aeterna-config" },
+    { name = "aeterna-di", editable = "packages/aeterna-di" },
+]
+
+[[package]]
+name = "aeterna-workspace"
 version = "1.0.0.dev1"
 source = { virtual = "." }
 dependencies = [
@@ -66,46 +126,6 @@ dev = [
 docs = [
     { name = "sphinx", specifier = ">=7.4,<9" },
     { name = "sphinxcontrib-mermaid", specifier = "==2.1.1" },
-]
-
-[[package]]
-name = "aeterna-config"
-version = "1.0.0.dev1"
-source = { editable = "packages/aeterna-config" }
-
-[[package]]
-name = "aeterna-config-yaml"
-version = "1.0.0.dev1"
-source = { editable = "packages/aeterna-config-yaml" }
-dependencies = [
-    { name = "aeterna-config" },
-    { name = "pyyaml" },
-]
-
-[package.metadata]
-requires-dist = [
-    { name = "aeterna-config", editable = "packages/aeterna-config" },
-    { name = "pyyaml", specifier = ">=6.0" },
-]
-
-[[package]]
-name = "aeterna-di"
-version = "1.0.0.dev1"
-source = { editable = "packages/aeterna-di" }
-
-[[package]]
-name = "aeterna-runtime"
-version = "1.0.0.dev1"
-source = { editable = "packages/aeterna-runtime" }
-dependencies = [
-    { name = "aeterna-config" },
-    { name = "aeterna-di" },
-]
-
-[package.metadata]
-requires-dist = [
-    { name = "aeterna-config", editable = "packages/aeterna-config" },
-    { name = "aeterna-di", editable = "packages/aeterna-di" },
 ]
 
 [[package]]

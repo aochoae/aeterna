@@ -374,11 +374,12 @@ class ServiceProvider(_ResolverBase):
             raise ScopeClosedError("ServiceProvider cannot close during service resolution")
         if timeout is not None:
             _validate_timeout(timeout)
-            try:
-                await asyncio.wait_for(asyncio.shield(self._close_task()), timeout)
-            except TimeoutError:
+            task = self._close_task()
+            done, _ = await asyncio.wait((task,), timeout=timeout)
+            if task not in done:
                 self._observe_timed_close()
-                raise
+                raise TimeoutError
+            task.result()
             return
         cancelled = await _finish_uninterrupted(self._close_task())
         if cancelled:
@@ -714,11 +715,12 @@ class ServiceScope(_ResolverBase):
             raise ScopeClosedError("ServiceScope cannot close during service resolution")
         if timeout is not None:
             _validate_timeout(timeout)
-            try:
-                await asyncio.wait_for(asyncio.shield(self._close_task()), timeout)
-            except TimeoutError:
+            task = self._close_task()
+            done, _ = await asyncio.wait((task,), timeout=timeout)
+            if task not in done:
                 self._observe_timed_close()
-                raise
+                raise TimeoutError
+            task.result()
             return
         cancelled = await _finish_uninterrupted(self._close_task())
         if cancelled:

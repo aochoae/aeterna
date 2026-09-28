@@ -9,6 +9,7 @@ Configuration API
    Configuration
    ConfigurationBinder
    ConfigurationBuilder
+   ConfigurationLimits
    ConfigurationProvider
    EnvironmentProvider
    MappingProvider

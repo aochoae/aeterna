@@ -24,7 +24,7 @@ class StartupError(ApplicationError):
 
         :param cause: Exception raised while starting hooks or hosted services.
         """
-        super().__init__(f"Application startup failed: {cause}")
+        super().__init__("Application startup failed")
         self.__cause__ = cause
 
 
@@ -40,8 +40,6 @@ class HostedServiceError(ApplicationError):
         :rtype: None
         """
         message = f"Hosted service {type(service).__qualname__} stopped unexpectedly"
-        if cause is not None:
-            message = f"{message}: {cause}"
         super().__init__(message)
         self.service = service
         self.__cause__ = cause

@@ -19,6 +19,40 @@ _MISSING = object()
 _VALUE_IS_NOT_A_MAPPING = "value is not a mapping"
 
 
+@dataclass(frozen=True, slots=True)
+class ConfigurationLimits:
+    """Bounds applied while configuration trees are copied and frozen.
+
+    :param max_depth: Maximum nesting depth accepted from configuration providers.
+    :param max_nodes: Maximum number of containers and scalar values in one snapshot.
+    """
+
+    max_depth: int = 64
+    max_nodes: int = 100_000
+
+    def __post_init__(self) -> None:
+        """Reject invalid limits before they are used by a provider pipeline."""
+        for name, value in (("max_depth", self.max_depth), ("max_nodes", self.max_nodes)):
+            if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+                raise ValueError(f"Configuration limit {name} must be a positive integer")
+
+
+@dataclass(slots=True)
+class _TreeBudget:
+    """Track configuration size without retaining provider values."""
+
+    limits: ConfigurationLimits
+    nodes: int = 0
+
+    def visit(self, depth: int) -> None:
+        """Record one tree node and enforce the configured bounds."""
+        if depth > self.limits.max_depth:
+            raise MergeError("Configuration exceeds the maximum nesting depth")
+        self.nodes += 1
+        if self.nodes > self.limits.max_nodes:
+            raise MergeError("Configuration exceeds the maximum expanded node count")
+
+
 class ConfigurationProvider(Protocol):
     """Protocol implemented by asynchronous configuration sources."""
 
@@ -106,9 +140,10 @@ class EnvironmentProvider:
 class ConfigurationBuilder:
     """Collect providers and build an immutable configuration snapshot."""
 
-    def __init__(self) -> None:
+    def __init__(self, *, limits: ConfigurationLimits | None = None) -> None:
         """Create an empty provider pipeline."""
         self._providers: list[ConfigurationProvider] = []
+        self._limits = limits or ConfigurationLimits()
 
     def add(self, provider: ConfigurationProvider) -> ConfigurationBuilder:
         """Append a provider and return this builder.
@@ -159,19 +194,20 @@ class ConfigurationBuilder:
         """
         merged: dict[str, object] = {}
         sources: dict[str, str] = {}
+        budget = _TreeBudget(self._limits)
         for provider in self._providers:
             try:
                 values = await provider.load()
                 if not isinstance(values, Mapping):
                     raise MergeError(f"Provider {provider.name!r} returned a non-mapping root")
-                merged = _merge(merged, values, provider.name, "", sources)
+                merged = _merge(merged, values, provider.name, "", sources, budget)
             except MergeError:
                 raise
             except Exception:
                 # Provider exceptions may contain secret payloads. The stable boundary retains
                 # only provider identity; adapters can expose sanitized details as MergeError.
                 raise ProviderError(provider.name) from None
-        return Configuration(merged, sources=sources)
+        return Configuration(merged, sources=sources, limits=self._limits)
 
 
 class Configuration:
@@ -183,6 +219,7 @@ class Configuration:
         *,
         sources: Mapping[str, str] | None = None,
         path: str = "",
+        limits: ConfigurationLimits | None = None,
     ) -> None:
         """Create an immutable configuration view.
 
@@ -190,7 +227,8 @@ class Configuration:
         :param sources: Optional mapping from fully qualified paths to provider names.
         :param path: Fully qualified path represented by this view.
         """
-        frozen = _freeze(values)
+        self._limits = limits or ConfigurationLimits()
+        frozen = _freeze(values, _TreeBudget(self._limits))
         if not isinstance(frozen, Mapping):  # pragma: no cover - constructor contract
             raise TypeError("Configuration root must be a mapping")
         self._values: Mapping[str, object] = frozen
@@ -248,7 +286,12 @@ class Configuration:
                 Mapping[str, object],
                 _VALUE_IS_NOT_A_MAPPING,
             )
-        return Configuration(value, sources=self._sources, path=self._qualify(path))
+        return Configuration(
+            value,
+            sources=self._sources,
+            path=self._qualify(path),
+            limits=self._limits,
+        )
 
     def bind[T](self, target: type[T], path: str = "") -> T:
         """Convert the value at ``path`` to the annotated type ``target``.
@@ -277,6 +320,10 @@ class Configuration:
         :return: The result, or `None` when unavailable.
         :rtype: str | None
         """
+        try:
+            self._lookup(path)
+        except MissingValueError:
+            return None
         return self._sources.get(self._qualify(path))
 
     def _lookup(self, path: str) -> object:
@@ -323,7 +370,7 @@ class ConfigurationBinder:
             return self._convert(value, target, path)  # type: ignore[return-value]
         except BindingError:
             raise
-        except (TypeError, ValueError):
+        except Exception:
             # Conversion errors frequently include the rejected value in their text.
             # Configuration values may be secrets, so neither the public message nor
             # the exception chain may expose the original exception.
@@ -347,6 +394,8 @@ class ConfigurationBinder:
         if isinstance(target, type) and is_dataclass(target):
             return self._convert_dataclass(value, target, path)
         if origin in {list, set, frozenset, tuple, Sequence}:
+            if origin is tuple and len(arguments) > 1 and arguments[1] is not Ellipsis:
+                raise BindingError(path, target, "heterogeneous tuple annotations are unsupported")
             return self._convert_sequence(value, origin, arguments, path)
         if origin is dict:
             return self._convert_mapping(value, arguments, path)
@@ -592,18 +641,30 @@ def _join(left: str, right: str) -> str:
     return f"{left}:{right}" if left else right
 
 
-def _freeze(value: object) -> object:
+def _freeze(value: object, budget: _TreeBudget, depth: int = 0) -> object:
     """Recursively make configuration containers immutable.
 
     :param value: Mapping, sequence, or scalar value to freeze.
     :return: The resulting value.
     :rtype: object
     """
+    budget.visit(depth)
     if isinstance(value, Mapping):
-        return MappingProxyType({str(key): _freeze(item) for key, item in value.items()})
+        return MappingProxyType(
+            {
+                _valid_key(key, "configuration"): _freeze(item, budget, depth + 1)
+                for key, item in value.items()
+            }
+        )
     if isinstance(value, (list, tuple)):
-        return tuple(_freeze(item) for item in value)
-    return value
+        return tuple(_freeze(item, budget, depth + 1) for item in value)
+    if isinstance(value, (set, frozenset)):
+        return frozenset(_freeze(item, budget, depth + 1) for item in value)
+    if isinstance(value, bytearray):
+        return bytes(value)
+    if isinstance(value, (str, bytes, int, float, bool, type(None), Enum)):
+        return value
+    raise MergeError(f"Configuration contains an unsupported value type: {type(value).__name__}")
 
 
 def _merge(
@@ -612,6 +673,8 @@ def _merge(
     provider: str,
     path: str,
     sources: MutableMapping[str, str],
+    budget: _TreeBudget,
+    depth: int = 0,
 ) -> dict[str, object]:
     """Overlay one configuration mapping onto another.
 
@@ -623,21 +686,31 @@ def _merge(
     :return: The merged configuration mapping.
     :rtype: dict[str, object]
     """
+    budget.visit(depth)
     result = dict(base)
     for raw_key, value in overlay.items():
         if not isinstance(raw_key, str) or not raw_key:
-            raise MergeError(f"Configuration keys must be non-empty strings, got {raw_key!r}")
+            raise MergeError("Configuration keys must be non-empty strings")
         key_path = _join(path, raw_key)
         existing = result.get(raw_key, _MISSING)
         if isinstance(existing, Mapping) and isinstance(value, Mapping):
-            result[raw_key] = _merge(existing, value, provider, key_path, sources)
+            result[raw_key] = _merge(
+                existing,
+                value,
+                provider,
+                key_path,
+                sources,
+                budget,
+                depth + 1,
+            )
         else:
-            result[raw_key] = _copy_tree(value, key_path)
+            _remove_sources(key_path, sources)
+            result[raw_key] = _copy_tree(value, key_path, budget, depth + 1)
             _record_sources(value, provider, key_path, sources)
     return result
 
 
-def _copy_tree(value: object, path: str) -> object:
+def _copy_tree(value: object, path: str, budget: _TreeBudget, depth: int) -> object:
     """Copy and validate a mutable configuration subtree.
 
     :param value: Subtree to copy into an intermediate configuration tree.
@@ -645,14 +718,24 @@ def _copy_tree(value: object, path: str) -> object:
     :return: The resulting value.
     :rtype: object
     """
+    budget.visit(depth)
     if isinstance(value, Mapping):
         return {
-            _valid_key(key, path): _copy_tree(item, _join(path, str(key)))
+            _valid_key(key, path): _copy_tree(item, _join(path, str(key)), budget, depth + 1)
             for key, item in value.items()
         }
     if isinstance(value, (list, tuple)):
-        return [_copy_tree(item, _join(path, str(index))) for index, item in enumerate(value)]
-    return value
+        return [
+            _copy_tree(item, _join(path, str(index)), budget, depth + 1)
+            for index, item in enumerate(value)
+        ]
+    if isinstance(value, (set, frozenset)):
+        return {_copy_tree(item, _join(path, "item"), budget, depth + 1) for item in value}
+    if isinstance(value, bytearray):
+        return bytes(value)
+    if isinstance(value, (str, bytes, int, float, bool, type(None), Enum)):
+        return value
+    raise MergeError(f"Configuration contains an unsupported value type: {type(value).__name__}")
 
 
 def _valid_key(key: object, path: str) -> str:
@@ -684,6 +767,14 @@ def _record_sources(
     if isinstance(value, Mapping):
         for key, item in value.items():
             _record_sources(item, provider, _join(path, str(key)), sources)
+
+
+def _remove_sources(path: str, sources: MutableMapping[str, str]) -> None:
+    """Remove provenance for a subtree that an overlay replaces."""
+    prefix = f"{path}:"
+    for existing_path in tuple(sources):
+        if existing_path == path or existing_path.startswith(prefix):
+            del sources[existing_path]
 
 
 def _assign_path(

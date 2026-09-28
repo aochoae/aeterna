@@ -134,10 +134,14 @@ Cancellation and failure
 
 Long-running code should await ``context.cancellation.wait()`` or check
 ``context.cancellation.is_cancelled``. Startup failures clean up hooks and
-services that have already started. Shutdown is bounded by the configured
-timeout (30 seconds by default); exceeding it produces ``ShutdownTimeoutError``
-inside the raised exception group, naming the hosted services that were still
-running. Cleanup failures are preserved in exception groups where appropriate.
+services that have already started. Shutdown is bounded by one configured
+deadline (30 seconds by default) across task waiting, component cleanup, and
+provider disposal. Exceeding it produces ``ShutdownTimeoutError`` inside the
+raised exception group, naming the hosted services that were still running.
+Cleanup failures are preserved in exception groups where appropriate. A
+callback that blocks synchronously or ignores cancellation cannot be forcefully
+stopped by Python; deployments need an external supervisor to enforce hard
+process termination in that case.
 
 ``run`` also survives cancellation of the task running it, which is how an
 embedding host usually shuts an application down. Shutdown still completes, and
@@ -148,7 +152,9 @@ hung service cannot defer termination indefinitely.
 The same completion guarantee applies when an embedded host directly awaits
 ``stop()``: cancellation is reported after shutdown completes. Cancellation
 during ``start()`` cleans hooks and services that already started and closes the
-provider before re-raising ``CancelledError``.
+provider before re-raising ``CancelledError``. A concurrent stop during startup
+requests startup cancellation and leaves the application in a terminal state;
+it cannot transition to ``RUNNING`` with a closed provider.
 
 If cleanup also fails after cancellation, Aeterna raises an ``ExceptionGroup``
 containing the cleanup failure and an ``ApplicationCancellationError``. This keeps framework
@@ -171,7 +177,13 @@ nothing until the application configures logging:
 * ``INFO`` — hook and hosted-service start and stop, with elapsed durations.
 * ``WARNING`` — the hosted services still running when the shutdown deadline
   expired.
-* ``ERROR`` — hook, service, and provider close failures.
+* ``ERROR`` — hook, service, provider-close, and detached cleanup failures,
+  using a safe summary that omits exception text by default.
 
 The warning and ``ShutdownTimeoutError`` both name the services that failed to
 stop before the deadline.
+
+Call ``ApplicationBuilder.use_diagnostic_tracebacks(True)`` only in a trusted
+diagnostic environment when raw lifecycle tracebacks are required. The default
+keeps exception messages out of framework logs because callbacks and providers
+can handle secrets.

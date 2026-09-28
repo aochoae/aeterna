@@ -92,7 +92,7 @@ class ActivationError(ResolutionError):
         :param path: Resolution path at the point of activation.
         :param cause: Original exception raised while creating the service.
         """
-        super().__init__(f"Failed to activate {key!r} at {_format_path(path)}: {cause}")
+        super().__init__(f"Failed to activate {key!r} at {_format_path(path)}")
         self.key = key
         self.path = tuple(path)
         self.__cause__ = cause

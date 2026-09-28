@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 
 import pytest
 from aeterna.di import (
@@ -64,16 +65,12 @@ async def test_missing_registration_is_validated_at_build() -> None:
     assert caught.value.path == (Handler, Clock)
 
 
-@pytest.mark.asyncio
-async def test_singleton_cannot_capture_scope() -> None:
+def test_singleton_cannot_capture_scope_at_build_time() -> None:
     services = ServiceCollection()
     services.add_type(Clock, lifetime=ServiceLifetime.SCOPED)
     services.add_type(Handler, lifetime=ServiceLifetime.SINGLETON)
-    provider = services.build_provider()
-    async with provider.create_scope() as scope:
-        with pytest.raises(CaptiveDependencyError):
-            await scope.get(Handler)
-    await provider.close()
+    with pytest.raises(CaptiveDependencyError):
+        services.build_provider()
 
 
 @pytest.mark.asyncio
@@ -605,6 +602,23 @@ def test_factory_declared_dependencies_are_validated_at_build() -> None:
     assert caught.value.path == (Needs, Missing)
 
 
+def test_declared_dependency_graph_rejects_cycles_at_build_time() -> None:
+    class First:
+        pass
+
+    class Second:
+        pass
+
+    services = (
+        ServiceCollection()
+        .add_factory(First, lambda _: First(), dependencies=(Second,))
+        .add_factory(Second, lambda _: Second(), dependencies=(First,))
+    )
+    with pytest.raises(CircularDependencyError) as caught:
+        services.build_provider()
+    assert caught.value.path == (First, Second, First)
+
+
 @pytest.mark.asyncio
 async def test_factory_without_declared_dependencies_still_resolves() -> None:
     class Needs:
@@ -780,4 +794,228 @@ async def test_scope_close_waits_for_in_flight_activation_and_releases_cache() -
     assert closed.is_set()
     assert scope._scoped == {}
     assert scope._owned == []
+    await provider.close()
+
+
+@pytest.mark.asyncio
+async def test_factory_resolver_cannot_escape_its_activation_boundary() -> None:
+    retained: list[object] = []
+
+    class Service:
+        pass
+
+    async def make(resolver: object) -> Service:
+        retained.append(resolver)
+        return Service()
+
+    provider = ServiceCollection().add_factory(Service, make).build_provider()
+    await provider.get(Service)
+    with pytest.raises(ScopeClosedError):
+        await retained[0].get(Service)  # type: ignore[attr-defined]
+    await provider.close()
+
+
+@pytest.mark.asyncio
+async def test_child_factory_resolution_drains_before_provider_cleanup() -> None:
+    child_started = asyncio.Event()
+    child_release = asyncio.Event()
+    resource_closed = asyncio.Event()
+    children: list[asyncio.Task[Resource]] = []
+
+    class Resource:
+        async def aclose(self) -> None:
+            resource_closed.set()
+
+    class Parent:
+        pass
+
+    async def make_resource(_: object) -> Resource:
+        child_started.set()
+        await child_release.wait()
+        return Resource()
+
+    async def make_parent(resolver: object) -> Parent:
+        children.append(asyncio.create_task(resolver.get(Resource)))  # type: ignore[attr-defined]
+        await child_started.wait()
+        return Parent()
+
+    provider = (
+        ServiceCollection()
+        .add_factory(Parent, make_parent)
+        .add_factory(
+            Resource,
+            make_resource,
+            lifetime=ServiceLifetime.SINGLETON,
+            owns_instance=True,
+        )
+        .build_provider()
+    )
+    await provider.get(Parent)
+
+    closing = asyncio.create_task(provider.close())
+    await asyncio.sleep(0)
+    assert not closing.done()
+
+    child_release.set()
+    assert isinstance(await children[0], Resource)
+    await closing
+    assert resource_closed.is_set()
+
+
+@pytest.mark.asyncio
+async def test_cross_task_scoped_cycle_reports_instead_of_deadlocking() -> None:
+    class First:
+        pass
+
+    class Second:
+        pass
+
+    both_activating = asyncio.Event()
+    activations = 0
+
+    async def make_first(resolver: object) -> First:
+        nonlocal activations
+        activations += 1
+        if activations == 2:
+            both_activating.set()
+        await both_activating.wait()
+        await resolver.get(Second)  # type: ignore[attr-defined]
+        return First()
+
+    async def make_second(resolver: object) -> Second:
+        nonlocal activations
+        activations += 1
+        if activations == 2:
+            both_activating.set()
+        await both_activating.wait()
+        await resolver.get(First)  # type: ignore[attr-defined]
+        return Second()
+
+    provider = (
+        ServiceCollection()
+        .add_factory(First, make_first, lifetime=ServiceLifetime.SCOPED)
+        .add_factory(Second, make_second, lifetime=ServiceLifetime.SCOPED)
+        .build_provider()
+    )
+    async with provider.create_scope() as scope:
+        results = await asyncio.wait_for(
+            asyncio.gather(scope.get(First), scope.get(Second), return_exceptions=True),
+            timeout=1.0,
+        )
+    assert all(isinstance(result, CircularDependencyError) for result in results)
+    await provider.close()
+
+
+@pytest.mark.asyncio
+async def test_close_timeout_leaves_one_observable_cleanup_operation() -> None:
+    release = asyncio.Event()
+
+    class Resource:
+        async def aclose(self) -> None:
+            await release.wait()
+
+    provider = (
+        ServiceCollection()
+        .add_factory(
+            Resource,
+            lambda _: Resource(),
+            lifetime=ServiceLifetime.SINGLETON,
+            owns_instance=True,
+        )
+        .build_provider()
+    )
+    await provider.get(Resource)
+    with pytest.raises(TimeoutError):
+        await provider.close(timeout=0.01)
+    release.set()
+    await provider.close()
+    assert provider._closed
+
+
+@pytest.mark.asyncio
+async def test_timed_out_cleanup_failure_is_observed_without_logging_secret(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    release = asyncio.Event()
+    secret = "not-for-logs"
+
+    class Resource:
+        async def aclose(self) -> None:
+            await release.wait()
+            raise RuntimeError(secret)
+
+    provider = (
+        ServiceCollection()
+        .add_factory(
+            Resource,
+            lambda _: Resource(),
+            lifetime=ServiceLifetime.SINGLETON,
+            owns_instance=True,
+        )
+        .build_provider()
+    )
+    await provider.get(Resource)
+
+    with caplog.at_level(logging.ERROR, logger="aeterna.di"):
+        with pytest.raises(TimeoutError):
+            await provider.close(timeout=0.01)
+        release.set()
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+
+    assert "ServiceProvider cleanup failed after its timeout" in caplog.messages
+    assert secret not in caplog.text
+    with pytest.raises(ExceptionGroup):
+        await provider.close()
+
+
+@pytest.mark.asyncio
+async def test_timed_out_scope_cleanup_failure_is_observed_without_logging_secret(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    release = asyncio.Event()
+    secret = "scope-not-for-logs"
+
+    class Resource:
+        async def aclose(self) -> None:
+            await release.wait()
+            raise RuntimeError(secret)
+
+    provider = (
+        ServiceCollection()
+        .add_factory(
+            Resource,
+            lambda _: Resource(),
+            lifetime=ServiceLifetime.SCOPED,
+            owns_instance=True,
+        )
+        .build_provider()
+    )
+    scope = provider.create_scope()
+    await scope.get(Resource)
+
+    with caplog.at_level(logging.ERROR, logger="aeterna.di"):
+        with pytest.raises(TimeoutError):
+            await scope.close(timeout=0.01)
+        release.set()
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+
+    assert "ServiceScope cleanup failed after its timeout" in caplog.messages
+    assert secret not in caplog.text
+    with pytest.raises(ExceptionGroup):
+        await scope.close()
+    await provider.close()
+
+
+@pytest.mark.asyncio
+async def test_close_rejects_non_finite_or_non_positive_timeout() -> None:
+    provider = ServiceCollection().build_provider()
+    scope = provider.create_scope()
+    for timeout in (float("inf"), float("nan"), 0.0, -1.0):
+        with pytest.raises(ValueError, match="finite positive"):
+            await provider.close(timeout=timeout)
+        with pytest.raises(ValueError, match="finite positive"):
+            await scope.close(timeout=timeout)
+    await scope.close()
     await provider.close()

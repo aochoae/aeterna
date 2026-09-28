@@ -12,7 +12,7 @@ from pathlib import Path
 from typing import Any
 
 import yaml
-from aeterna.config import MergeError
+from aeterna.config import ConfigurationLimits, MergeError
 from yaml.constructor import ConstructorError
 
 
@@ -58,6 +58,15 @@ class YamlProvider:
 
     path: str | Path
     encoding: str = "utf-8"
+    max_bytes: int = 1_048_576
+    max_aliases: int = 128
+    limits: ConfigurationLimits = ConfigurationLimits()
+
+    def __post_init__(self) -> None:
+        """Validate parser limits before any file content is read."""
+        for name, value in (("max_bytes", self.max_bytes), ("max_aliases", self.max_aliases)):
+            if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+                raise ValueError(f"YAML limit {name} must be a positive integer")
 
     @property
     def name(self) -> str:
@@ -75,10 +84,14 @@ class YamlProvider:
         :return: The resulting configuration mapping.
         :rtype: Mapping[str, object]
         """
-        documents = await asyncio.to_thread(_load_documents, Path(self.path), self.encoding)
-        if len(documents) > 1:
-            raise MergeError(f"YAML provider {self.path!s} requires exactly one document")
-        document: Any = documents[0] if documents else None
+        document = await asyncio.to_thread(
+            _load_document,
+            Path(self.path),
+            self.encoding,
+            self.max_bytes,
+            self.max_aliases,
+            self.limits,
+        )
         if document is None:
             return {}
         if not isinstance(document, Mapping):
@@ -86,13 +99,55 @@ class YamlProvider:
         return document
 
 
-def _load_documents(path: Path, encoding: str) -> list[Any]:
-    """Read and parse all YAML documents in a worker thread.
+def _load_document(
+    path: Path,
+    encoding: str,
+    max_bytes: int,
+    max_aliases: int,
+    limits: ConfigurationLimits,
+) -> Any:
+    """Read and parse one bounded YAML document in a worker thread.
 
     :param path: Filesystem path of the YAML source.
     :param encoding: Text encoding used to read the source.
-    :return: Parsed YAML documents.
+    :return: The parsed document, or ``None`` for an empty document.
     :rtype: list[Any]
     """
-    content = path.read_text(encoding=encoding)
-    return list(yaml.load_all(content, Loader=_UniqueKeyLoader))
+    with path.open("rb") as source:
+        content = source.read(max_bytes + 1)
+    if len(content) > max_bytes:
+        raise MergeError("YAML input exceeds the maximum byte count")
+    text = content.decode(encoding)
+    _validate_yaml_events(text, max_aliases, limits)
+    documents = iter(yaml.load_all(text, Loader=_UniqueKeyLoader))
+    sentinel = object()
+    first = next(documents, sentinel)
+    return None if first is sentinel else first
+
+
+def _validate_yaml_events(text: str, max_aliases: int, limits: ConfigurationLimits) -> None:
+    """Bound YAML parser work before constructing the configuration object graph."""
+    aliases = 0
+    depth = 0
+    nodes = 0
+    documents = 0
+    for event in yaml.parse(text, Loader=_UniqueKeyLoader):
+        if isinstance(event, yaml.events.DocumentStartEvent):
+            documents += 1
+            if documents > 1:
+                raise MergeError("YAML provider requires exactly one document")
+        if isinstance(event, (yaml.events.MappingStartEvent, yaml.events.SequenceStartEvent)):
+            depth += 1
+            nodes += 1
+        elif isinstance(event, yaml.events.ScalarEvent):
+            nodes += 1
+        elif isinstance(event, yaml.events.AliasEvent):
+            aliases += 1
+            if aliases > max_aliases:
+                raise MergeError("YAML input exceeds the maximum alias count")
+        if depth > limits.max_depth:
+            raise MergeError("YAML input exceeds the maximum nesting depth")
+        if nodes > limits.max_nodes:
+            raise MergeError("YAML input exceeds the maximum parsed node count")
+        if isinstance(event, (yaml.events.MappingEndEvent, yaml.events.SequenceEndEvent)):
+            depth -= 1

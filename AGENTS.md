@@ -10,7 +10,7 @@ core packages.
 
 The repository is a `uv` workspace. The root project is an aggregate development
 project (`tool.uv.package = false`); the five installable workspace members are
-all version `1.0.0.dev1`. The `aeterna` member is a metadata-only convenience
+all version `1.0.0.dev2`. The `aeterna` member is a metadata-only convenience
 distribution, while the four component members contribute typed subpackages to
 the shared `aeterna` namespace:
 

@@ -1,13 +1,13 @@
 [project]
 name = "aeterna-config-yaml"
-version = "1.0.0.dev1"
+version = "1.0.0.dev2"
 description = "YAML configuration provider for aeterna"
 readme = "README.md"
 requires-python = ">=3.12"
 license = "MIT"
-dependencies = ["aeterna-config>=1.0.0.dev1,<2", "PyYAML>=6.0"]
-authors = [{ name = "aeterna Contributors" }]
-maintainers = [{ name = "aeterna Maintainers" }]
+dependencies = ["aeterna-config>=1.0.0.dev2,<2", "PyYAML>=6.0"]
+authors = [{ name = "Alberto Ochoa" }]
+maintainers = [{ name = "Alberto Ochoa" }]
 keywords = ["yaml", "configuration", "provider", "aeterna"]
 classifiers = [
   "Intended Audience :: Developers",
@@ -29,7 +29,7 @@ Issues = "https://github.com/aochoae/aeterna/issues"
 aeterna-config = { workspace = true }
 
 [build-system]
-requires = ["hatchling"]
+requires = ["hatchling==1.32.4"]
 build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]

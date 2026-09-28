@@ -81,9 +81,11 @@ is not registered.
 Validation and ownership
 ------------------------
 
-Building a provider validates duplicate registrations and constructor
-dependencies. Circular graphs report their resolution path, including cycles
-spread across two concurrently resolving tasks.
+Building a provider validates duplicate registrations, constructor dependencies,
+declared factory dependencies, declared dependency cycles, and transitive
+singleton-to-scoped paths before registrations are frozen. Circular graphs
+report their resolution path, including cycles spread across two concurrently
+resolving tasks and scoped activations.
 
 Ownership is opt-in. A registration is closed by the container only when it is
 made with ``owns_instance=True``; otherwise the caller keeps responsibility for
@@ -102,7 +104,9 @@ owned scoped services belong to the scope that resolved them.
 Closing a provider or scope stops new resolutions, waits for resolutions already
 in progress, then closes owned resources. Closed boundaries release their
 instance caches and cleanup callbacks. Cancellation of the task awaiting
-``close()`` is reported only after cleanup completes.
+``close()`` is reported only after cleanup completes. A caller that needs a
+bounded wait can pass ``timeout=`` to ``close()``; a timeout does not abandon
+the one tracked cleanup operation, so a later close can await its completion.
 
 If a resource itself raises ``asyncio.CancelledError`` while closing, Aeterna
 continues cleanup and reports ``ServiceCancellationError`` inside an
@@ -128,7 +132,13 @@ build-time validation that constructor graphs receive:
 
 Declared dependencies are validated, not injected — the factory still resolves
 them through the resolver it is handed. Omitting them is supported and defers
-missing-registration failures to the first resolution.
+missing-registration failures to the first resolution. The resolver is valid
+only for the activation that received it; retaining it and resolving after the
+factory returns raises ``ScopeClosedError``. This prevents factories from
+starting new work after their provider or scope has begun closing. A child task
+that starts a resolution before the factory returns is included in the active
+resolution count, so provider or scope cleanup waits for its owned resources to
+be registered and released.
 
 Stereotype conventions
 ----------------------

@@ -12,8 +12,10 @@ from typing import Any, Literal
 import pytest
 from aeterna.config import (
     BindingError,
+    Configuration,
     ConfigurationBinder,
     ConfigurationBuilder,
+    ConfigurationLimits,
     EnvironmentProvider,
     MergeError,
     MissingValueError,
@@ -548,3 +550,81 @@ async def test_bind_non_type_annotation_raises_binding_error() -> None:
     # the binder's unsupported-target fallthrough.
     with pytest.raises(BindingError, match="unsupported target type"):
         config.bind(Literal["a", "b"], "v")  # type: ignore[arg-type]
+
+
+@pytest.mark.asyncio
+async def test_snapshot_freezes_supported_mutable_leaves_and_rejects_unknown_objects() -> None:
+    values = {"roles": {"reader"}, "payload": bytearray(b"safe")}
+    config = await ConfigurationBuilder().add_mapping(values).build()
+    values["roles"].add("writer")  # type: ignore[union-attr]
+    values["payload"].extend(b"-changed")  # type: ignore[union-attr]
+
+    assert config.require("roles") == frozenset({"reader"})
+    assert config.require("payload") == b"safe"
+
+    with pytest.raises(MergeError, match="unsupported value type"):
+        await ConfigurationBuilder().add_mapping({"value": object()}).build()
+
+
+@pytest.mark.asyncio
+async def test_configuration_limits_bound_depth_and_node_count() -> None:
+    with pytest.raises(MergeError, match="maximum nesting depth"):
+        await (
+            ConfigurationBuilder(limits=ConfigurationLimits(max_depth=1))
+            .add_mapping({"one": {"two": 2}})
+            .build()
+        )
+
+    with pytest.raises(MergeError, match="maximum expanded node count"):
+        await (
+            ConfigurationBuilder(limits=ConfigurationLimits(max_nodes=2))
+            .add_mapping({"one": 1, "two": 2})
+            .build()
+        )
+
+
+@pytest.mark.asyncio
+async def test_binding_unexpected_errors_are_sanitized() -> None:
+    secret = "synthetic-secret"
+
+    @dataclass
+    class Settings:
+        password: str
+
+        def __post_init__(self) -> None:
+            raise RuntimeError(secret)
+
+    config = await ConfigurationBuilder().add_mapping({"password": secret}).build()
+    with pytest.raises(BindingError) as caught:
+        config.bind(Settings)
+    assert secret not in str(caught.value)
+    assert caught.value.__cause__ is None
+
+
+@pytest.mark.asyncio
+async def test_heterogeneous_tuple_and_stale_provenance_are_rejected() -> None:
+    config = await (
+        ConfigurationBuilder()
+        .add_mapping({"value": {"old": 1}}, name="first")
+        .add_mapping({"value": 2}, name="second")
+        .build()
+    )
+
+    with pytest.raises(BindingError, match="heterogeneous tuple"):
+        ConfigurationBinder().bind(["1", "two"], tuple[int, str])
+    assert config.source("value:old") is None
+
+
+def test_configuration_limits_and_direct_snapshots_validate_all_leaf_types() -> None:
+    for limits in (
+        ConfigurationLimits(max_depth=1),
+        ConfigurationLimits(max_nodes=1),
+    ):
+        assert limits.max_depth > 0
+    with pytest.raises(ValueError, match="positive integer"):
+        ConfigurationLimits(max_depth=True)  # type: ignore[arg-type]
+
+    configuration = Configuration({"payload": bytearray(b"safe")})
+    assert configuration.require("payload") == b"safe"
+    with pytest.raises(MergeError, match="unsupported value type"):
+        Configuration({"value": object()})

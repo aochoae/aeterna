@@ -1,15 +1,15 @@
 [project]
 name = "aeterna"
-version = "1.0.0.dev1"
+version = "1.0.0.dev2"
 description = "Convenience distribution for the Aeterna framework"
 readme = "README.md"
 requires-python = ">=3.12"
 license = "MIT"
 dependencies = [
-  "aeterna-config>=1.0.0.dev1,<2",
-  "aeterna-config-yaml>=1.0.0.dev1,<2",
-  "aeterna-di>=1.0.0.dev1,<2",
-  "aeterna-runtime>=1.0.0.dev1,<2",
+  "aeterna-config>=1.0.0.dev2,<2",
+  "aeterna-config-yaml>=1.0.0.dev2,<2",
+  "aeterna-di>=1.0.0.dev2,<2",
+  "aeterna-runtime>=1.0.0.dev2,<2",
 ]
 authors = [{ name = "Alberto Ochoa" }]
 maintainers = [{ name = "Alberto Ochoa" }]
@@ -37,7 +37,7 @@ aeterna-di = { workspace = true }
 aeterna-runtime = { workspace = true }
 
 [build-system]
-requires = ["hatchling"]
+requires = ["hatchling==1.32.4"]
 build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]

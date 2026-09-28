@@ -7,6 +7,8 @@ import ast
 import tomllib
 from pathlib import Path
 
+import yaml
+
 
 def _aeterna_imports(root: Path) -> set[str]:
     imported: set[str] = set()
@@ -48,10 +50,10 @@ def test_meta_package_declares_all_core_packages() -> None:
     dependencies = set(manifest["project"]["dependencies"])
 
     assert dependencies == {
-        "aeterna-config>=1.0.0.dev1,<2",
-        "aeterna-config-yaml>=1.0.0.dev1,<2",
-        "aeterna-di>=1.0.0.dev1,<2",
-        "aeterna-runtime>=1.0.0.dev1,<2",
+        "aeterna-config>=1.0.0.dev2,<2",
+        "aeterna-config-yaml>=1.0.0.dev2,<2",
+        "aeterna-di>=1.0.0.dev2,<2",
+        "aeterna-runtime>=1.0.0.dev2,<2",
     }
 
 
@@ -61,3 +63,48 @@ def test_meta_package_is_metadata_only() -> None:
 
     assert (source / "py.typed").is_file()
     assert not any(source.rglob("*.py"))
+
+
+def test_release_workflow_builds_and_validates_the_current_artifact_set() -> None:
+    root = Path(__file__).parents[1]
+    workflow = yaml.safe_load((root / ".github" / "workflows" / "publish.yml").read_text())
+    jobs = workflow["jobs"]
+
+    assert jobs["build"]["needs"] == "verify_source"
+    assert jobs["verify_artifacts"]["needs"] == "build"
+    assert jobs["publish_components"]["needs"] == "verify_artifacts"
+    assert jobs["publish_meta"]["needs"] == "publish_components"
+
+    build_install = next(
+        step["run"] for step in jobs["build"]["steps"] if step["name"] == "Install build"
+    )
+    assert build_install.startswith("python -m pip install --only-binary=:all:")
+    assert "\n" not in build_install
+    assert all(
+        requirement in build_install for requirement in ("build", "packaging", "pyproject-hooks")
+    )
+
+    verification = next(
+        step["run"]
+        for step in jobs["verify_artifacts"]["steps"]
+        if step["name"] == "Install every wheel and source distribution"
+    )
+    assert '"--constraint"' in verification
+    assert "as_uri()" in verification
+
+
+def test_artifact_smoke_test_pins_sibling_dependencies_to_built_wheels() -> None:
+    root = Path(__file__).parents[1]
+    workflow = yaml.safe_load(
+        (root / ".github" / "workflows" / "quality-assurance.yml").read_text()
+    )
+    smoke_test = workflow["jobs"]["smoke_test"]
+    installation = next(
+        step["run"]
+        for step in smoke_test["steps"]
+        if step["name"] == "Install built wheel and source distribution in fresh environments"
+    )
+
+    assert '"--constraint"' in installation
+    assert "as_uri()" in installation
+    assert "if name != package" in installation

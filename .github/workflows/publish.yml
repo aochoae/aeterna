@@ -7,9 +7,37 @@ permissions:
   contents: read
 
 jobs:
+  verify_source:
+    name: Verify source revision
+    if: github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/heads/release/')
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+        with:
+          persist-credentials: false
+      - name: Set up Python 3.12
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v6.0.0
+        with:
+          python-version: "3.12"
+      - name: Install verification tooling
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install "uv==0.12.5"
+          uv sync --locked --group docs
+      - name: Run tests and static checks
+        run: |
+          uv run pytest
+          uv run ruff check .
+          uv run ruff format --check .
+          uv run mypy
+      - name: Check installed dependencies for known advisories
+        run: uv tool run --from "pip-audit==2.10.0" pip-audit --strict
+
   build:
     name: Build ${{ matrix.package }}
     if: github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/heads/release/')
+    needs: verify_source
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -23,43 +51,122 @@ jobs:
 
     steps:
       - name: Check out repository
-        uses: actions/checkout@v6
+        uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
         with:
           persist-credentials: false
 
       - name: Set up Python 3.12
-        uses: actions/setup-python@v6
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v6.0.0
         with:
           python-version: "3.12"
 
       - name: Install build
-        run: >-
-          python -m pip install --only-binary :all:
-          "build==1.6.0"
-          "packaging==26.3"
+        run: |
+          python -m pip install --only-binary=:all: "build==1.6.0" "packaging==26.3"
           "pyproject-hooks==1.2.0"
 
       - name: Build source distribution and wheel
         run: python -m build --sdist --wheel "packages/${{ matrix.package }}"
 
       - name: Upload distribution artifacts
-        uses: actions/upload-artifact@v5
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v5.0.0
         with:
           name: dist-${{ matrix.package }}
           path: packages/${{ matrix.package }}/dist/
           if-no-files-found: error
 
-  publish:
-    name: Publish ${{ matrix.package }} to PyPI
+  verify_artifacts:
+    name: Verify release artifacts
     if: github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/heads/release/')
     needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Set up Python 3.12
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v6.0.0
+        with:
+          python-version: "3.12"
+      - name: Download distribution artifacts
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v5.0.0
+        with:
+          pattern: dist-*
+          path: dist-artifacts
+          merge-multiple: true
+      - name: Install every wheel and source distribution
+        run: |
+          python - <<'PY'
+          import subprocess
+          import tempfile
+          import venv
+          from pathlib import Path
+
+          artifacts = Path("dist-artifacts")
+          distributions = sorted([*artifacts.glob("*.whl"), *artifacts.glob("*.tar.gz")])
+          if len(distributions) != 10:
+              raise SystemExit(f"Expected ten artifacts, found {len(distributions)}")
+
+          packages = (
+              "aeterna",
+              "aeterna-config",
+              "aeterna-config-yaml",
+              "aeterna-di",
+              "aeterna-runtime",
+          )
+          wheels = {
+              package: matches
+              for package in packages
+              if len(matches := list(artifacts.glob(f"{package.replace('-', '_')}-*.whl"))) == 1
+          }
+          if len(wheels) != len(packages):
+              raise SystemExit("Expected exactly one wheel for every Aeterna distribution")
+
+          def distribution_package(artifact):
+              matches = [
+                  name
+                  for name in packages
+                  if artifact.name.startswith(f"{name.replace('-', '_')}-")
+              ]
+              if len(matches) != 1:
+                  raise SystemExit(f"Could not identify the package for {artifact.name}")
+              return matches[0]
+
+          for artifact in distributions:
+              with tempfile.TemporaryDirectory() as directory:
+                  environment = Path(directory) / "environment"
+                  venv.EnvBuilder(with_pip=True).create(environment)
+                  python = environment / "bin" / "python"
+                  package = distribution_package(artifact)
+                  constraints = Path(directory) / "aeterna-artifacts.txt"
+                  constraints.write_text(
+                      "\n".join(
+                          f"{name} @ {wheel[0].resolve().as_uri()}"
+                          for name, wheel in wheels.items()
+                          if name != package
+                      )
+                  )
+                  subprocess.check_call([
+                      python,
+                      "-m",
+                      "pip",
+                      "install",
+                      "--constraint",
+                      str(constraints),
+                      "--find-links",
+                      str(artifacts),
+                      str(artifact),
+                  ])
+                  subprocess.check_call([python, "-c", "import aeterna"])
+                  print(f"validated {artifact.name}")
+          PY
+
+  publish_components:
+    name: Publish ${{ matrix.package }} to PyPI
+    if: github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/heads/release/')
+    needs: verify_artifacts
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
         include:
-          - package: aeterna
-            environment: pypi_aeterna
           - package: aeterna-config-yaml
             environment: pypi_aeterna-config-yaml
           - package: aeterna-config
@@ -78,11 +185,33 @@ jobs:
 
     steps:
       - name: Download distribution artifacts
-        uses: actions/download-artifact@v6
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v5.0.0
         with:
           name: dist-${{ matrix.package }}
           path: dist/
 
+      - name: Publish distribution to PyPI
+        uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # v1.14.2
+        with:
+          skip-existing: true
+
+  publish_meta:
+    name: Publish aeterna to PyPI
+    if: github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/heads/release/')
+    needs: publish_components
+    runs-on: ubuntu-latest
+    environment:
+      name: pypi_aeterna
+      url: https://pypi.org/project/aeterna/
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - name: Download distribution artifacts
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v5.0.0
+        with:
+          name: dist-aeterna
+          path: dist/
       - name: Publish distribution to PyPI
         uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # v1.14.2
         with:

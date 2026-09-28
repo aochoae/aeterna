@@ -10,8 +10,8 @@ hosting that owns the event loop and handles termination signals.
 - Run hooks in registration order on startup and reverse order on shutdown.
 - Supervise hosted-service tasks, propagate unexpected completion or failure, and request
   cooperative cancellation during shutdown.
-- Close the service provider during shutdown and enforce a configurable graceful-shutdown
-  timeout.
+- Close the service provider during shutdown and enforce one configurable graceful-shutdown
+  deadline across all asynchronous cleanup phases.
 - Use `run()` for framework-owned event-loop and signal handling, or build/start/wait/stop
   from an embedding framework's event loop.
 - Emit runtime debug logging only when the consuming application configures logging.
@@ -82,7 +82,14 @@ failures enter `FAILED`. Application code can read `context.state`, but state ch
 runtime-owned. A hosted service's `run()` method should continue until its cancellation
 token is cancelled or it fails. Shutdown requests cancellation, stops services and hooks in
 reverse order, waits for running tasks, then closes the provider. The default timeout is
-30 seconds and `use_shutdown_timeout()` configures it.
+30 seconds and `use_shutdown_timeout()` configures it. A timeout records unfinished work
+without making an unbounded post-cancellation wait. Python cannot terminate a blocking or
+cancellation-resistant callback, so production deployments should use an external process
+supervisor for hard termination.
+
+Lifecycle logs use safe summaries by default and omit callback exception text. Enable raw
+tracebacks only in trusted diagnostic environments with
+`ApplicationBuilder.use_diagnostic_tracebacks(True)`.
 
 `Application.run(main=None)` is the standalone convenience API: it owns the event loop, builds
 the application, starts hooks and hosted services, supervises execution, and stops the application.

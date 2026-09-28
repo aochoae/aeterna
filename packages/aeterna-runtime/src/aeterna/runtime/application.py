@@ -8,6 +8,7 @@ from __future__ import annotations
 import asyncio
 import inspect
 import logging
+import math
 import time
 from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass
@@ -184,6 +185,7 @@ class ApplicationBuilder:
         self._hooks: list[LifecycleHook] = []
         self._hosted_keys: list[type[object]] = []
         self._shutdown_timeout = 30.0
+        self._diagnostic_tracebacks = False
         self._built = False
 
     def add_configuration(self, provider: ConfigurationProvider) -> ApplicationBuilder:
@@ -243,9 +245,15 @@ class ApplicationBuilder:
         :rtype: ApplicationBuilder
         """
         self._ensure_mutable()
-        if seconds <= 0:
-            raise ValueError("Shutdown timeout must be positive")
+        if not math.isfinite(seconds) or seconds <= 0:
+            raise ValueError("Shutdown timeout must be a finite positive number")
         self._shutdown_timeout = seconds
+        return self
+
+    def use_diagnostic_tracebacks(self, enabled: bool = True) -> ApplicationBuilder:
+        """Enable raw lifecycle exception tracebacks for trusted diagnostics only."""
+        self._ensure_mutable()
+        self._diagnostic_tracebacks = enabled
         return self
 
     async def build(self) -> Application:
@@ -272,6 +280,7 @@ class ApplicationBuilder:
             tuple(self._hooks),
             tuple(self._hosted_keys),
             self._shutdown_timeout,
+            self._diagnostic_tracebacks,
         )
 
     def _ensure_mutable(self) -> None:
@@ -293,6 +302,7 @@ class Application:
         hooks: Sequence[LifecycleHook],
         hosted_keys: Sequence[type[object]],
         shutdown_timeout: float,
+        diagnostic_tracebacks: bool,
     ) -> None:
         """Create a built application with its immutable composition state.
 
@@ -307,11 +317,13 @@ class Application:
         self._hooks = tuple(hooks)
         self._hosted_keys = tuple(hosted_keys)
         self._shutdown_timeout = shutdown_timeout
+        self._diagnostic_tracebacks = diagnostic_tracebacks
         self._started_hooks: list[LifecycleHook] = []
         self._started_services: list[HostedService] = []
         self._tasks: dict[asyncio.Task[None], HostedService] = {}
         self._stop_lock = asyncio.Lock()
         self._stop_complete = asyncio.Event()
+        self._start_task: asyncio.Task[Any] | None = None
 
     @property
     def state(self) -> ApplicationState:
@@ -339,10 +351,13 @@ class Application:
         """
         if self.state is not ApplicationState.CREATED:
             raise InvalidStateError(f"Cannot start application in state {self.state.value}")
+        self._start_task = asyncio.current_task()
         self.context._set_state(ApplicationState.STARTING)
         try:
             await self._start_hooks()
             await self._start_services()
+            if self.context.cancellation.is_cancelled:
+                raise asyncio.CancelledError
             self.context._set_state(ApplicationState.RUNNING)
             self._schedule_hosted_services()
         except asyncio.CancelledError:
@@ -350,6 +365,8 @@ class Application:
             raise
         except Exception as error:
             await self._handle_startup_failure(error)
+        finally:
+            self._start_task = None
 
     async def run(self, main: ApplicationMain[T] | None = None) -> T | None:
         """Start, execute the optional main callback, and stop the application.
@@ -437,12 +454,19 @@ class Application:
                 return
             if self.state is ApplicationState.CREATED:
                 raise InvalidStateError("Cannot stop an application that has not started")
+            deadline = asyncio.get_running_loop().time() + self._shutdown_timeout
+            if self.state is ApplicationState.STARTING:
+                await self._cancel_startup(deadline)
+                if self.state is ApplicationState.STARTING:
+                    self.context._set_state(ApplicationState.FAILED)
+                self._stop_complete.set()
+                return
             was_failed = self.state is ApplicationState.FAILED
             if not was_failed:
                 self.context._set_state(ApplicationState.STOPPING)
             self.context.cancellation.cancel()
-            errors = await self._shutdown_started_components()
-            provider_error = await self._close_service_provider()
+            errors = await self._shutdown_started_components(deadline)
+            provider_error = await self._close_service_provider(deadline)
             if provider_error is not None:
                 errors.append(provider_error)
             self._complete_stop(was_failed, errors)
@@ -502,7 +526,10 @@ class Application:
     async def _handle_cancelled_startup(self) -> None:
         """Clean up a cancelled startup and re-raise its cancellation outcome."""
         self.context._set_state(ApplicationState.FAILED)
-        cleanup_error, interrupted = await _await_uninterrupted(self._cleanup_after_start_failure())
+        deadline = asyncio.get_running_loop().time() + self._shutdown_timeout
+        cleanup_error, interrupted = await _await_uninterrupted(
+            self._cleanup_after_start_failure(deadline)
+        )
         if cleanup_error is not None:
             errors: list[Exception] = [ApplicationCancellationError(), cleanup_error]
             if interrupted:
@@ -516,7 +543,10 @@ class Application:
     async def _handle_startup_failure(self, error: Exception) -> None:
         """Clean up a failed startup and preserve its primary failure."""
         self.context._set_state(ApplicationState.FAILED)
-        cleanup_error, interrupted = await _await_uninterrupted(self._cleanup_after_start_failure())
+        deadline = asyncio.get_running_loop().time() + self._shutdown_timeout
+        cleanup_error, interrupted = await _await_uninterrupted(
+            self._cleanup_after_start_failure(deadline)
+        )
         secondary: list[Exception] = []
         if cleanup_error is not None:
             secondary.append(cleanup_error)
@@ -551,16 +581,31 @@ class Application:
                 ) from stop_error
             raise
 
-    async def _shutdown_started_components(self) -> list[Exception]:
+    async def _cancel_startup(self, deadline: float) -> None:
+        """Cancel a concurrent startup before shutdown can close shared resources."""
+        self.context.cancellation.cancel()
+        task = self._start_task
+        if task is None or task is asyncio.current_task():
+            raise InvalidStateError("Application cannot stop itself while starting")
+        task.cancel()
+        if await _wait_until(task, deadline):
+            return
+        _observe_task(task)
+
+    async def _shutdown_started_components(self, deadline: float) -> list[Exception]:
         """Stop started components within the configured graceful-shutdown deadline."""
         errors: list[Exception] = []
-        try:
-            async with asyncio.timeout(self._shutdown_timeout):
-                cleanup_error = await self._cleanup_started()
-                if cleanup_error is not None:
-                    errors.append(cleanup_error)
-                await self._await_hosted_tasks()
-        except TimeoutError:
+        cleanup = asyncio.create_task(self._cleanup_started())
+        if not await _wait_until(cleanup, deadline):
+            _observe_task(cleanup)
+            errors.append(self._shutdown_timeout_error("while stopping started components"))
+            return errors
+        cleanup_error = cleanup.result()
+        if cleanup_error is not None:
+            errors.append(cleanup_error)
+        waiting = asyncio.create_task(self._await_hosted_tasks())
+        if not await _wait_until(waiting, deadline):
+            _observe_task(waiting)
             errors.append(await self._cancel_stalled_tasks())
         return errors
 
@@ -585,16 +630,20 @@ class Application:
         )
         for task in self._tasks:
             task.cancel()
-        await asyncio.gather(*self._tasks, return_exceptions=True)
         detail = f" while waiting for {', '.join(stalled)}" if stalled else ""
         return ShutdownTimeoutError(f"Shutdown exceeded {self._shutdown_timeout:g} seconds{detail}")
 
-    async def _close_service_provider(self) -> Exception | None:
+    async def _close_service_provider(self, deadline: float) -> Exception | None:
         """Close the service provider and return a failure without interrupting cleanup."""
+        remaining = _remaining(deadline)
+        if remaining <= 0:
+            return self._shutdown_timeout_error("while closing the service provider")
         try:
-            await self.context.services.close()
+            await self.context.services.close(timeout=remaining)
+        except TimeoutError:
+            return self._shutdown_timeout_error("while closing the service provider")
         except Exception as error:
-            _logger.exception("Failed to close service provider")
+            self._log_exception("Failed to close service provider", error)
             return error
         return None
 
@@ -618,18 +667,12 @@ class Application:
             raise HostedServiceError(service, error) from error
         raise HostedServiceError(service)
 
-    async def _cleanup_after_start_failure(self) -> Exception | None:
+    async def _cleanup_after_start_failure(self, deadline: float) -> Exception | None:
         """Clean partially started components and close their service provider."""
-        errors: list[Exception] = []
-        cleanup_error = await self._cleanup_started()
-        if cleanup_error is not None:
-            errors.append(cleanup_error)
-        try:
-            await self.context.services.close()
-        except asyncio.CancelledError:
-            errors.append(ApplicationCancellationError("Service provider cleanup was cancelled"))
-        except Exception as error:
-            errors.append(error)
+        errors = await self._shutdown_started_components(deadline)
+        provider_error = await self._close_service_provider(deadline)
+        if provider_error is not None:
+            errors.append(provider_error)
         if errors:
             return ExceptionGroup("Application startup cleanup failed", errors)
         return None
@@ -653,7 +696,7 @@ class Application:
                 _logger.error("Hosted service %s failed to stop: %s", name, cancellation_error)
                 errors.append(cancellation_error)
             except Exception as error:
-                _logger.exception("Hosted service %s failed to stop", name)
+                self._log_exception(f"Hosted service {name} failed to stop", error)
                 errors.append(error)
             else:
                 _logger.info(
@@ -672,7 +715,7 @@ class Application:
                 _logger.error("Lifecycle hook %s failed to stop: %s", name, cancellation_error)
                 errors.append(cancellation_error)
             except Exception as error:
-                _logger.exception("Lifecycle hook %s failed to stop", name)
+                self._log_exception(f"Lifecycle hook {name} failed to stop", error)
                 errors.append(error)
             else:
                 _logger.info(
@@ -682,6 +725,19 @@ class Application:
         if errors:
             return ExceptionGroup("Lifecycle cleanup failed", errors)
         return None
+
+    def _shutdown_timeout_error(self, detail: str) -> ShutdownTimeoutError:
+        """Create a safe deadline error without exposing callback internals."""
+        return ShutdownTimeoutError(
+            f"Shutdown exceeded {self._shutdown_timeout:g} seconds {detail}"
+        )
+
+    def _log_exception(self, message: str, error: Exception) -> None:
+        """Log a safe lifecycle failure unless diagnostics explicitly allow tracebacks."""
+        if self._diagnostic_tracebacks:
+            _logger.exception(message, exc_info=error)
+        else:
+            _logger.error(message)
 
 
 def _describe(callback: LifecycleCallback) -> str:
@@ -708,12 +764,12 @@ async def _invoke(callback: LifecycleCallback, context: ApplicationContext) -> N
 
 
 async def _cancel_main_task(main_task: asyncio.Task[Any] | None) -> None:
-    """Cancel and collect a main task when supervision ends for another reason."""
+    """Cancel main work without allowing a cancellation-resistant task to block shutdown."""
     if main_task is None:
         return
     if not main_task.done():
         main_task.cancel()
-    await asyncio.gather(main_task, return_exceptions=True)
+        _observe_task(main_task)
 
 
 async def _finish_supervision(
@@ -725,7 +781,42 @@ async def _finish_supervision(
     await asyncio.gather(cancellation_wait, return_exceptions=True)
     if main_task is not None and not main_task.done():
         main_task.cancel()
-        await asyncio.gather(main_task, return_exceptions=True)
+        _observe_task(main_task)
+
+
+def _remaining(deadline: float) -> float:
+    """Return the remaining duration of one shutdown deadline."""
+    return max(0.0, deadline - asyncio.get_running_loop().time())
+
+
+async def _wait_until(task: asyncio.Task[Any], deadline: float) -> bool:
+    """Wait for a task until a shared deadline without awaiting a stuck cancellation."""
+    remaining = _remaining(deadline)
+    if remaining <= 0:
+        task.cancel()
+        return False
+    done, _ = await asyncio.wait({task}, timeout=remaining)
+    if done:
+        return True
+    task.cancel()
+    return False
+
+
+def _observe_task(task: asyncio.Task[Any]) -> None:
+    """Consume and safely report a detached task outcome after a shutdown timeout."""
+
+    def observe(completed: asyncio.Task[Any]) -> None:
+        try:
+            outcome = completed.result()
+        except asyncio.CancelledError:
+            return
+        except Exception:
+            _logger.error("Detached runtime task failed after its shutdown deadline")
+            return
+        if isinstance(outcome, Exception):
+            _logger.error("Detached runtime cleanup failed after its shutdown deadline")
+
+    task.add_done_callback(observe)
 
 
 def _main_task_result[T](main_task: asyncio.Task[T] | None) -> T | None:

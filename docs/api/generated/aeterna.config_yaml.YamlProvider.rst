@@ -26,6 +26,9 @@
    
       ~YamlProvider.path
       ~YamlProvider.encoding
+      ~YamlProvider.max_bytes
+      ~YamlProvider.max_aliases
+      ~YamlProvider.limits
       ~YamlProvider.name
    
    

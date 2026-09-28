@@ -7,7 +7,9 @@ from __future__ import annotations
 
 import asyncio
 import inspect
-from collections.abc import Awaitable, Callable, Sequence
+import logging
+import math
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass
 from enum import Enum
 from types import MappingProxyType
@@ -27,6 +29,10 @@ from .errors import (
 T = TypeVar("T")
 Factory = Callable[["ServiceResolver"], object | Awaitable[object]]
 _MISSING = object()
+
+
+_logger = logging.getLogger("aeterna.di")
+_logger.addHandler(logging.NullHandler())
 
 
 class ServiceLifetime(Enum):
@@ -253,6 +259,7 @@ class ServiceCollection:
             for dependency in descriptor.dependencies:
                 if dependency not in descriptors:
                     raise MissingRegistrationError(dependency, (descriptor.key, dependency))
+        _validate_dependency_graph(descriptors)
         self._built = True
         return ServiceProvider(descriptors)
 
@@ -333,6 +340,8 @@ class ServiceProvider(_ResolverBase):
         self._locks: dict[type[object], asyncio.Lock] = {}
         self._owned: list[Callable[[], Awaitable[None] | None]] = []
         self._close_lock = asyncio.Lock()
+        self._close_operation: asyncio.Task[None] | None = None
+        self._timed_close_observed = False
         self._closing = False
         self._closed = False
         self._active_resolutions = 0
@@ -355,7 +364,7 @@ class ServiceProvider(_ResolverBase):
         self._ensure_open()
         return ServiceScope(self)
 
-    async def close(self) -> None:
+    async def close(self, *, timeout: float | None = None) -> None:  # noqa: ASYNC109
         """Close owned singleton resources in reverse acquisition order.
 
         :return: None.
@@ -363,9 +372,40 @@ class ServiceProvider(_ResolverBase):
         """
         if self._is_resolving_in_current_task():
             raise ScopeClosedError("ServiceProvider cannot close during service resolution")
-        cancelled = await _finish_uninterrupted(self._close_core())
+        if timeout is not None:
+            _validate_timeout(timeout)
+            try:
+                await asyncio.wait_for(asyncio.shield(self._close_task()), timeout)
+            except TimeoutError:
+                self._observe_timed_close()
+                raise
+            return
+        cancelled = await _finish_uninterrupted(self._close_task())
         if cancelled:
             raise asyncio.CancelledError
+
+    def _close_task(self) -> asyncio.Task[None]:
+        """Return the single close operation shared by concurrent callers."""
+        if self._close_operation is None:
+            self._close_operation = asyncio.create_task(self._close_core())
+        return self._close_operation
+
+    def _observe_timed_close(self) -> None:
+        """Consume a timed-out close result without exposing resource exception details."""
+        if self._timed_close_observed:
+            return
+        self._timed_close_observed = True
+        task = self._close_task()
+
+        def observe(completed: asyncio.Task[None]) -> None:
+            try:
+                completed.result()
+            except asyncio.CancelledError:
+                _logger.error("ServiceProvider cleanup was cancelled after its timeout")
+            except Exception:
+                _logger.error("ServiceProvider cleanup failed after its timeout")
+
+        task.add_done_callback(observe)
 
     async def _close_core(self) -> None:
         """Wait for active resolutions and close the provider exactly once."""
@@ -532,6 +572,8 @@ class ServiceProvider(_ResolverBase):
             raise
         except Exception as error:
             raise ActivationError(descriptor.key, context.path, error) from error
+        finally:
+            resolver.invalidate()
 
     def _ownership_boundary(
         self, descriptor: ServiceDescriptor, scope: ServiceScope | None
@@ -609,12 +651,16 @@ class ServiceScope(_ResolverBase):
         self._locks: dict[type[object], asyncio.Lock] = {}
         self._owned: list[Callable[[], Awaitable[None] | None]] = []
         self._close_lock = asyncio.Lock()
+        self._close_operation: asyncio.Task[None] | None = None
+        self._timed_close_observed = False
         self._closing = False
         self._closed = False
         self._active_resolutions = 0
         self._resolution_tasks: dict[asyncio.Task[Any], int] = {}
         self._resolutions_drained = asyncio.Event()
         self._resolutions_drained.set()
+        self._activating: dict[type[object], asyncio.Task[Any]] = {}
+        self._waiting: dict[asyncio.Task[Any], type[object]] = {}
         super().__init__(root, self)
 
     async def _resolve_scoped(
@@ -631,12 +677,34 @@ class ServiceScope(_ResolverBase):
         if descriptor.key in self._scoped:
             return self._scoped[descriptor.key]
         lock = self._locks.setdefault(descriptor.key, asyncio.Lock())
-        async with lock:
+        task = asyncio.current_task()
+        if task is not None:
+            cycle = self._cross_task_cycle(descriptor.key, task)
+            if cycle is not None:
+                raise CircularDependencyError(cycle)
+            self._waiting[task] = descriptor.key
+        try:
+            await lock.acquire()
+        finally:
+            if task is not None:
+                self._waiting.pop(task, None)
+        try:
             if descriptor.key not in self._scoped:
-                self._scoped[descriptor.key] = await self._root._activate(descriptor, self, context)
+                if task is not None:
+                    self._activating[descriptor.key] = task
+                try:
+                    self._scoped[descriptor.key] = await self._root._activate(
+                        descriptor,
+                        self,
+                        context,
+                    )
+                finally:
+                    self._activating.pop(descriptor.key, None)
             return self._scoped[descriptor.key]
+        finally:
+            lock.release()
 
-    async def close(self) -> None:
+    async def close(self, *, timeout: float | None = None) -> None:  # noqa: ASYNC109
         """Close owned scoped resources in reverse acquisition order.
 
         :return: None.
@@ -644,9 +712,40 @@ class ServiceScope(_ResolverBase):
         """
         if self._is_resolving_in_current_task():
             raise ScopeClosedError("ServiceScope cannot close during service resolution")
-        cancelled = await _finish_uninterrupted(self._close_core())
+        if timeout is not None:
+            _validate_timeout(timeout)
+            try:
+                await asyncio.wait_for(asyncio.shield(self._close_task()), timeout)
+            except TimeoutError:
+                self._observe_timed_close()
+                raise
+            return
+        cancelled = await _finish_uninterrupted(self._close_task())
         if cancelled:
             raise asyncio.CancelledError
+
+    def _close_task(self) -> asyncio.Task[None]:
+        """Return the single close operation shared by concurrent callers."""
+        if self._close_operation is None:
+            self._close_operation = asyncio.create_task(self._close_core())
+        return self._close_operation
+
+    def _observe_timed_close(self) -> None:
+        """Consume a timed-out close result without exposing resource exception details."""
+        if self._timed_close_observed:
+            return
+        self._timed_close_observed = True
+        task = self._close_task()
+
+        def observe(completed: asyncio.Task[None]) -> None:
+            try:
+                completed.result()
+            except asyncio.CancelledError:
+                _logger.error("ServiceScope cleanup was cancelled after its timeout")
+            except Exception:
+                _logger.error("ServiceScope cleanup failed after its timeout")
+
+        task.add_done_callback(observe)
 
     async def _close_core(self) -> None:
         """Wait for active resolutions and close the scope exactly once."""
@@ -663,6 +762,8 @@ class ServiceScope(_ResolverBase):
                 self._owned.clear()
                 self._scoped.clear()
                 self._locks.clear()
+                self._activating.clear()
+                self._waiting.clear()
                 self._closed = True
                 self._closing = False
 
@@ -721,6 +822,24 @@ class ServiceScope(_ResolverBase):
         task = asyncio.current_task()
         return task is not None and task in self._resolution_tasks
 
+    def _cross_task_cycle(
+        self, key: type[object], task: asyncio.Task[Any]
+    ) -> tuple[type[object], ...] | None:
+        """Return a scoped activation cycle that would otherwise deadlock."""
+        chain: list[type[object]] = [key]
+        current = key
+        while True:
+            owner = self._activating.get(current)
+            if owner is None:
+                return None
+            if owner is task:
+                return (*chain, key)
+            blocked_on = self._waiting.get(owner)
+            if blocked_on is None or blocked_on in chain:
+                return None
+            chain.append(blocked_on)
+            current = blocked_on
+
 
 class _ContextResolver(_ResolverBase):
     def __init__(
@@ -734,6 +853,11 @@ class _ContextResolver(_ResolverBase):
         """
         super().__init__(root, scope)
         self._context = context
+        self._valid = True
+
+    def invalidate(self) -> None:
+        """Prevent a factory from retaining this resolver beyond activation."""
+        self._valid = False
 
     async def get(self, key: type[T]) -> T:
         """Resolve a dependency while preserving the current resolution context.
@@ -742,7 +866,19 @@ class _ContextResolver(_ResolverBase):
         :return: The converted or resolved value.
         :rtype: T
         """
-        return await self._root._resolve(key, self._scope, self._context)  # type: ignore[return-value]
+        if not self._valid:
+            raise ScopeClosedError("ServiceResolver is only valid while its factory is activating")
+        self._root._begin_resolution()
+        scope_started = False
+        try:
+            if self._scope is not None:
+                self._scope._begin_resolution()
+                scope_started = True
+            return await self._root._resolve(key, self._scope, self._context)  # type: ignore[return-value]
+        finally:
+            if scope_started:
+                self._scope._end_resolution()  # type: ignore[union-attr]
+            self._root._end_resolution()
 
 
 def _constructor_dependencies(implementation: type[object]) -> tuple[type[object], ...]:
@@ -778,6 +914,42 @@ def _constructor_dependencies(implementation: type[object]) -> tuple[type[object
             )
         dependencies.append(annotation)
     return tuple(dependencies)
+
+
+def _validate_dependency_graph(descriptors: Mapping[type[object], ServiceDescriptor]) -> None:
+    """Reject declared dependency cycles and singleton-to-scoped paths at build time."""
+
+    def visit(
+        descriptor: ServiceDescriptor,
+        path: tuple[type[object], ...],
+        singleton_graph: bool,
+    ) -> None:
+        for dependency_key in descriptor.dependencies:
+            dependency = descriptors[dependency_key]
+            dependency_path = (*path, dependency_key)
+            if dependency_key in path:
+                index = path.index(dependency_key)
+                raise CircularDependencyError((*path[index:], dependency_key))
+            if singleton_graph and dependency.lifetime is ServiceLifetime.SCOPED:
+                raise CaptiveDependencyError(dependency_key, dependency_path)
+            visit(
+                dependency,
+                dependency_path,
+                singleton_graph or dependency.lifetime is ServiceLifetime.SINGLETON,
+            )
+
+    for descriptor in descriptors.values():
+        visit(
+            descriptor,
+            (descriptor.key,),
+            descriptor.lifetime is ServiceLifetime.SINGLETON,
+        )
+
+
+def _validate_timeout(timeout: float) -> None:
+    """Reject invalid close deadlines before scheduling timed cleanup."""
+    if not math.isfinite(timeout) or timeout <= 0:
+        raise ValueError("Close timeout must be a finite positive number")
 
 
 async def _enter_and_track(

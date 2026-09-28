@@ -236,7 +236,7 @@ async def test_execution_and_shutdown_both_fail_raises_exception_group() -> None
     with pytest.raises(ExceptionGroup) as caught:
         await application.run()
     messages = [str(e) for e in caught.value.exceptions]
-    assert any("run failed" in m for m in messages)
+    assert any("FailingStopWorker" in message for message in messages)
 
 
 @pytest.mark.asyncio
@@ -333,7 +333,7 @@ async def test_hosted_failure_cancels_and_surfaces() -> None:
             pass
 
     application = await ApplicationBuilder().add_hosted_service(FailingWorker).build()
-    with pytest.raises(HostedServiceError, match="worker failed"):
+    with pytest.raises(HostedServiceError, match="FailingWorker"):
         await application.run()
     assert application.context.cancellation.is_cancelled
     assert application.state is ApplicationState.FAILED
@@ -357,7 +357,7 @@ async def test_embedded_wait_surfaces_hosted_failure_and_cleans_up() -> None:
     application = await ApplicationBuilder().add_hosted_service(FailingWorker).build()
     await application.start()
 
-    with pytest.raises(HostedServiceError, match="embedded worker failed"):
+    with pytest.raises(HostedServiceError, match="FailingWorker"):
         await application.wait()
 
     assert stopped
@@ -648,7 +648,7 @@ async def test_hosted_failure_interrupts_running_main_callback() -> None:
             main_cancelled.set()
 
     application = await ApplicationBuilder().add_hosted_service(FailingWorker).build()
-    with pytest.raises(HostedServiceError, match="worker failed while main was running"):
+    with pytest.raises(HostedServiceError, match="FailingWorker"):
         await application.run(main)
 
     assert main_cancelled.is_set()
@@ -741,3 +741,177 @@ async def test_direct_stop_completes_before_reporting_caller_cancellation() -> N
         await stopping
     assert application.context.services._closed
     assert application.state is ApplicationState.STOPPED
+
+
+@pytest.mark.asyncio
+async def test_stop_during_startup_cancels_start_without_reopening_closed_provider() -> None:
+    started = asyncio.Event()
+    stopped: list[str] = []
+
+    async def start(_: ApplicationContext) -> None:
+        started.set()
+        await asyncio.Event().wait()
+
+    async def stop(_: ApplicationContext) -> None:
+        stopped.append("stop")
+
+    application = await ApplicationBuilder().add_lifecycle_hook(start, stop).build()
+    starting = asyncio.create_task(application.start())
+    await started.wait()
+    await application.stop()
+
+    with pytest.raises(asyncio.CancelledError):
+        await starting
+    assert application.state is ApplicationState.FAILED
+    assert application.context.services._closed
+    assert stopped == []
+
+
+@pytest.mark.asyncio
+async def test_shutdown_deadline_includes_provider_cleanup() -> None:
+    release = asyncio.Event()
+
+    class Resource:
+        async def aclose(self) -> None:
+            await release.wait()
+
+    def configure(services: ServiceCollection, _: Configuration) -> None:
+        services.add_factory(
+            Resource,
+            lambda _: Resource(),
+            lifetime=ServiceLifetime.SINGLETON,
+            owns_instance=True,
+        )
+
+    application = await (
+        ApplicationBuilder().use_shutdown_timeout(0.01).configure_services(configure).build()
+    )
+    await application.start()
+    await application.context.services.get(Resource)
+    with pytest.raises(ExceptionGroup) as caught:
+        await asyncio.wait_for(application.stop(), timeout=0.2)
+    assert any(isinstance(error, ShutdownTimeoutError) for error in caught.value.exceptions)
+    assert application.state is ApplicationState.FAILED
+
+    release.set()
+    await application.context.services.close()
+
+
+@pytest.mark.asyncio
+async def test_startup_failure_cleanup_uses_the_shutdown_deadline() -> None:
+    release = asyncio.Event()
+
+    class Resource:
+        async def aclose(self) -> None:
+            await release.wait()
+
+    def configure(services: ServiceCollection, _: Configuration) -> None:
+        services.add_factory(
+            Resource,
+            lambda _: Resource(),
+            lifetime=ServiceLifetime.SINGLETON,
+            owns_instance=True,
+        )
+
+    async def acquire(context: ApplicationContext) -> None:
+        await context.services.get(Resource)
+
+    async def fail(_: ApplicationContext) -> None:
+        raise RuntimeError("startup failure")
+
+    application = await (
+        ApplicationBuilder()
+        .use_shutdown_timeout(0.01)
+        .configure_services(configure)
+        .add_lifecycle_hook(acquire, lambda _: None)
+        .add_lifecycle_hook(fail, lambda _: None)
+        .build()
+    )
+    with pytest.raises(ExceptionGroup) as caught:
+        await asyncio.wait_for(application.start(), timeout=0.2)
+    release.set()
+    await application.context.services.close()
+    assert caught.value.subgroup(ShutdownTimeoutError) is not None
+    assert application.state is ApplicationState.FAILED
+
+
+def test_shutdown_timeout_requires_a_finite_positive_value() -> None:
+    builder = ApplicationBuilder()
+    for value in (float("inf"), float("nan"), 0.0, -1.0):
+        with pytest.raises(ValueError):
+            builder.use_shutdown_timeout(value)
+
+
+def test_diagnostic_tracebacks_are_explicitly_opt_in() -> None:
+    builder = ApplicationBuilder()
+    assert builder.use_diagnostic_tracebacks()._diagnostic_tracebacks
+    assert not builder.use_diagnostic_tracebacks(False)._diagnostic_tracebacks
+
+
+@pytest.mark.asyncio
+async def test_default_runtime_logs_do_not_include_callback_secrets(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    secret = "synthetic-runtime-secret"
+
+    async def failing_stop(_: ApplicationContext) -> None:
+        raise RuntimeError(secret)
+
+    application = await (
+        ApplicationBuilder().add_lifecycle_hook(lambda _: None, failing_stop).build()
+    )
+    await application.start()
+    with caplog.at_level(logging.ERROR, logger="aeterna.runtime"):
+        with pytest.raises(ExceptionGroup):
+            await application.stop()
+    assert secret not in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_detached_cleanup_failure_is_reported_without_exception_details(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    from aeterna.runtime.application import _observe_task
+
+    release = asyncio.Event()
+    secret = "detached-runtime-secret"
+
+    async def cleanup() -> Exception:
+        await release.wait()
+        return RuntimeError(secret)
+
+    task = asyncio.create_task(cleanup())
+    with caplog.at_level(logging.ERROR, logger="aeterna.runtime"):
+        _observe_task(task)
+        release.set()
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+
+    assert task.done()
+    assert "Detached runtime cleanup failed after its shutdown deadline" in caplog.messages
+    assert secret not in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_detached_task_exception_is_reported_without_exception_details(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    from aeterna.runtime.application import _observe_task
+
+    release = asyncio.Event()
+    secret = "detached-task-secret"
+
+    async def cleanup() -> None:
+        await release.wait()
+        raise RuntimeError(secret)
+
+    task = asyncio.create_task(cleanup())
+    with caplog.at_level(logging.ERROR, logger="aeterna.runtime"):
+        _observe_task(task)
+        release.set()
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+
+    assert task.done()
+    assert "Detached runtime task failed after its shutdown deadline" in caplog.messages
+    assert secret not in caplog.text

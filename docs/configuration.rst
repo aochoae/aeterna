@@ -70,7 +70,30 @@ YAML files
 An empty file produces an empty mapping. A sequence root, multiple documents,
 or duplicate keys is invalid. Malformed YAML and file I/O failures become a
 sanitized ``ProviderError``; invalid YAML structure that can be described
-safely raises ``MergeError``.
+safely raises ``MergeError``. To keep configuration loading bounded, the
+default YAML limits are 1 MiB of input, 128 aliases, 64 levels, and 100,000
+parsed nodes. The provider reads at most the configured byte limit plus one
+byte, so oversized files are rejected before a full in-memory buffer is
+allocated. Trusted deployments can pass explicit positive limits to
+``YamlProvider``.
+
+Configuration limits
+--------------------
+
+``ConfigurationLimits`` bounds the shape of every configuration snapshot. Its
+defaults are ``max_depth=64`` and ``max_nodes=100_000``. The builder applies
+the limits while it merges providers, and ``Configuration`` applies them when
+it freezes a direct mapping. Pass the same limits to both a YAML provider and
+a builder when a deployment needs a larger, trusted configuration:
+
+.. code-block:: python
+
+   from aeterna.config import ConfigurationBuilder, ConfigurationLimits
+   from aeterna.config_yaml import YamlProvider
+
+   limits = ConfigurationLimits(max_depth=96, max_nodes=200_000)
+   builder = ConfigurationBuilder(limits=limits)
+   builder.add(YamlProvider("settings.yaml", limits=limits, max_bytes=2_000_000))
 
 Custom and secret providers
 ---------------------------
@@ -104,8 +127,12 @@ Reading and binding
 
 Use colon-delimited paths with ``get``, ``require``, and ``contains``. Use
 ``section`` to create a view rooted at a mapping, and ``source`` to inspect
-provenance. ``as_mapping`` returns an immutable mapping; lists and tuples are
-frozen as tuples.
+provenance. ``source`` returns ``None`` when the requested path does not
+exist. ``as_mapping`` returns an immutable mapping; lists and tuples are
+frozen as tuples, sets as ``frozenset``, and ``bytearray`` values as ``bytes``.
+Snapshots accept standard immutable scalar values and enums. They reject
+arbitrary mutable application objects so a validated setting cannot change by
+alias after the snapshot is built.
 
 ``bind`` converts values to annotated Python types. It supports dataclasses,
 ``Enum``, ``bool``, ``str``, ``int``, ``float``, unions, sequences,

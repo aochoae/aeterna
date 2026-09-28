@@ -19,6 +19,7 @@
       ~ApplicationBuilder.add_lifecycle_hook
       ~ApplicationBuilder.build
       ~ApplicationBuilder.configure_services
+      ~ApplicationBuilder.use_diagnostic_tracebacks
       ~ApplicationBuilder.use_shutdown_timeout
    
    

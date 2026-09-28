@@ -8,6 +8,8 @@ single YAML mapping document through the standard configuration-provider interfa
 - Reads and parses YAML files in a worker thread so the async event loop is not blocked.
 - Accepts one mapping document or an empty document, which becomes an empty mapping.
 - Rejects duplicate keys, multiple documents, sequence roots, and other non-mapping roots.
+- Bounds untrusted input by default to 1 MiB, 128 aliases, 64 levels, and 100,000 nodes.
+  Oversized files are rejected after reading only the configured limit plus one byte.
 - Keeps YAML and its dependency outside the core `aeterna-config` package.
 
 ## Requirements
@@ -69,10 +71,15 @@ Multiple documents and non-mapping roots raise `aeterna.config.MergeError`; dupl
 keys are rejected by the YAML loader. When loaded through `ConfigurationBuilder`, unsafe
 parse or I/O failures cross the public boundary as `aeterna.config.ProviderError`.
 
-## Public API
+## Limits and public API
 
-- `YamlProvider(path, encoding="utf-8")`: asynchronous provider for one YAML mapping
-  document.
+`YamlProvider` applies resource limits before it creates a configuration tree.
+Pass positive explicit values only for trusted configuration files. Its `limits`
+argument is an `aeterna.config.ConfigurationLimits` instance and defaults to
+`ConfigurationLimits()`.
+
+- `YamlProvider(path, encoding="utf-8", *, max_bytes=1_048_576, max_aliases=128,
+  limits=ConfigurationLimits())`: asynchronous provider for one YAML mapping document.
 
 The package defines no public exceptions; it uses errors from `aeterna.config`.
 
